@@ -122,6 +122,9 @@ LOG_LEVEL = 'INFO'
 # We only want output when explicitly specified with -o flag
 FEEDS = {}
 
+# Required by scrapy-playwright
+TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+
 # Scrapy-Playwright settings for JavaScript rendering
 DOWNLOAD_HANDLERS = {
     "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",

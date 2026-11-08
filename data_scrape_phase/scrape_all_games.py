@@ -18,6 +18,7 @@ Usage:
 import subprocess
 import argparse
 import json
+import os
 import time
 import sys
 from pathlib import Path
@@ -28,11 +29,12 @@ import csv
 class GameScraper:
     """Scrapes reviews for multiple games"""
     
-    def __init__(self, max_reviews=None, delay=5, skip_errors=True, skip_existing=True, output_file=None):
+    def __init__(self, max_reviews=None, delay=5, skip_errors=True, skip_existing=True, output_file=None, flaresolverr_url=None):
         self.max_reviews = max_reviews
         self.delay = delay
         self.skip_errors = skip_errors
         self.skip_existing = skip_existing
+        self.flaresolverr_url = flaresolverr_url
         self.results = {
             'success': [],
             'failed': [],
@@ -244,8 +246,9 @@ class GameScraper:
         print(f"[{game_num}/{total_games}] Scraping: {game_name} ({platform})")
         print("=" * 70)
         
-        # Build scrapy command - output to temporary JSON file first
-        temp_output = f"data/temp_{game_name}_{platform}.json"
+        project_root = Path(__file__).resolve().parent.parent
+        scrapy_project_dir = Path(__file__).resolve().parent
+        temp_output = project_root / "data" / f"temp_{game_name}_{platform}.json"
         
         # Use Python from virtual environment to ensure scrapy-playwright is available
         python_exe = sys.executable  # This gets the current Python interpreter
@@ -254,11 +257,17 @@ class GameScraper:
             python_exe, "-m", "scrapy", "crawl", "metacritic_reviews",
             "-a", f"game_name={game_name}",
             "-a", f"platform={platform}",
-            "-o", temp_output
+            "-o", str(temp_output)
         ]
-        
+
         if self.max_reviews:
             command.extend(["-a", f"max_reviews={self.max_reviews}"])
+        if self.flaresolverr_url:
+            command.extend(["-a", f"flaresolverr_url={self.flaresolverr_url}"])
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{scrapy_project_dir}:{env.get('PYTHONPATH', '')}"
+        env["SCRAPY_SETTINGS_MODULE"] = "metacritic_scraper.settings"
         
         print(f"Command: {' '.join(command)}")
         print()
@@ -277,7 +286,9 @@ class GameScraper:
             # Run without capturing output so we can see live progress
             result = subprocess.run(
                 command,
-                timeout=timeout
+                timeout=timeout,
+                cwd=scrapy_project_dir,
+                env=env
             )
             
             print("─" * 70)
@@ -520,6 +531,8 @@ Workflow:
                       help='Force re-scrape all games (ignore progress file)')
     parser.add_argument('--start-from', type=int, default=1,
                       help='Start from game number N (for resuming)')
+    parser.add_argument('--flaresolverr', type=str, default=None,
+                      help='FlareSolverr URL, e.g. http://localhost:8191 (recommended)')
     
     args = parser.parse_args()
     
@@ -529,7 +542,8 @@ Workflow:
         delay=args.delay,
         skip_errors=args.skip_errors,
         skip_existing=not args.force_rescrape,  # If force rescrape, don't skip existing
-        output_file=args.output if hasattr(args, 'output') else None
+        output_file=args.output if hasattr(args, 'output') else None,
+        flaresolverr_url=args.flaresolverr
     )
     
     # Load games

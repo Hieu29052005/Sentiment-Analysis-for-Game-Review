@@ -1,600 +1,510 @@
 """
-Metacritic Game Reviews Spider (with Playwright for JavaScript rendering)
+Metacritic Game Reviews Spider
 
-This spider scrapes user reviews from Metacritic for video games.
-It collects review text, scores, sentiment categories, and metadata.
-
-Uses Scrapy-Playwright to render JavaScript and load all reviews dynamically.
+Supports the current Nuxt-based Metacritic UI and optional FlareSolverr
+for Cloudflare-protected pages and backend API requests.
 
 Usage:
-    scrapy crawl metacritic_reviews -a game_url="https://www.metacritic.com/game/pc/..."
-    scrapy crawl metacritic_reviews -a game_name="the-last-of-us-part-ii" -a platform="playstation-4"
-    scrapy crawl metacritic_reviews -a game_name="the-last-of-us-part-ii" -a platform="playstation-4" -a max_reviews_per_platform=100
+    scrapy crawl metacritic_reviews -a game_name="elden-ring" -a platform="pc"
+    scrapy crawl metacritic_reviews -a game_name="elden-ring" -a platform="pc" \
+        -a flaresolverr_url="http://localhost:8191"
 """
 
-import scrapy
-from datetime import datetime
+import html as html_lib
+import json
 import re
-from urllib.parse import urljoin
-from metacritic_scraper.items import GameReviewItem, GameItem
+from datetime import datetime
+from urllib.parse import urlparse
+
+import scrapy
+from bs4 import BeautifulSoup
+
+from metacritic_scraper.items import GameReviewItem
+
+
+class NuxtPayload:
+    """Decode Nuxt's devalue-serialized __NUXT_DATA__ array."""
+
+    SPECIAL = {
+        -1: None,
+        -2: None,
+        -3: float("nan"),
+        -4: float("inf"),
+        -5: float("-inf"),
+        -6: -0.0,
+    }
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.memo = {}
+
+    def resolve(self, ref):
+        if isinstance(ref, int):
+            if ref < 0:
+                return self.SPECIAL.get(ref)
+            if ref in self.memo:
+                return self.memo[ref]
+            value = self.payload[ref]
+            if isinstance(value, dict):
+                result = {}
+                self.memo[ref] = result
+                for key, child in value.items():
+                    result[key] = self.resolve(child)
+                return result
+            if isinstance(value, list):
+                result = []
+                self.memo[ref] = result
+                for child in value:
+                    result.append(self.resolve(child))
+                return result
+            self.memo[ref] = value
+            return value
+        return ref
 
 
 class MetacriticReviewsSpider(scrapy.Spider):
     name = "metacritic_reviews"
-    allowed_domains = ["metacritic.com"]
-    
+    allowed_domains = ["metacritic.com", "localhost", "127.0.0.1"]
+
     custom_settings = {
-        'DOWNLOAD_DELAY': 3,
-        'CONCURRENT_REQUESTS': 2,
-        'AUTOTHROTTLE_ENABLED': True,
-        'DOWNLOAD_TIMEOUT': 60,
-        'RETRY_TIMES': 5,
+        "DOWNLOAD_DELAY": 2,
+        "CONCURRENT_REQUESTS": 2,
+        "AUTOTHROTTLE_ENABLED": True,
+        "DOWNLOAD_TIMEOUT": 90,
+        "RETRY_TIMES": 3,
     }
-    
-    def __init__(self, game_url=None, game_name=None, platform=None, max_reviews_per_platform=None, *args, **kwargs):
-        super(MetacriticReviewsSpider, self).__init__(*args, **kwargs)
-        
-        self.max_reviews_per_platform = int(max_reviews_per_platform) if max_reviews_per_platform else None
-        self.total_reviews_count = 0  # Total across all platforms
-        self.platform_reviews_count = {}  # Track count per platform
-        
-        # Build the game URL from components or use provided URL
-        if game_url:
-            self.start_urls = [game_url]
-        elif game_name and platform:
-            # Construct URL: https://www.metacritic.com/game/{platform}/{game-name}
-            self.start_urls = [f"https://www.metacritic.com/game/{platform}/{game_name}"]
-        else:
-            # Default example game if no parameters provided
-            self.logger.warning("No game specified. Using default example game.")
-            self.start_urls = ["https://www.metacritic.com/game/playstation-4/the-last-of-us-part-ii"]
-    
-    def start_requests(self):
-        """Generate initial requests for game pages"""
-        for url in self.start_urls:
-            self.logger.info(f"Starting to scrape: {url}")
-            # Use Playwright for JavaScript rendering
-            yield scrapy.Request(
-                url=url,
-                callback=self.parse_game_page,
-                errback=self.handle_error,
-                meta={
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_goto_kwargs": {
-                        "wait_until": "domcontentloaded",  # Wait until DOM is ready
-                        "timeout": 60000,  # 60 seconds timeout
-                    },
-                    "playwright_page_methods": [
-                        {"wait_for_timeout": 5000},  # Additional 5 second wait
-                    ],
-                }
-            )
-    
-    def parse_game_page(self, response):
-        """Parse the main game page to extract game metadata and navigate to reviews"""
-        
-        self.logger.info(f"Parsing game page: {response.url}")
-        
-        # Extract game metadata
-        game_title = response.css('div.product_title h1::text').get() or \
-                    response.css('h1.c-productHero_title span::text').get() or \
-                    response.css('h1::text').get()
-        
-        # Platform - try multiple selectors
-        platform = response.css('span.platform a::text').get() or \
-                  response.css('.c-ProductHeroGamePlatformInfo ::text').get() or \
-                  response.css('[class*="Platform"]::text').get()
-        
-        # Metascore
-        metascore = response.css('div.metascore_w span::text').get() or \
-                   response.css('div.c-siteReviewScore span::text').get() or \
-                   response.css('[class*="Metascore"] span::text').get()
-        
-        # Release date - extract from c-gameDetails_ReleaseDate class
-        release_date_elem = response.css('.c-gameDetails_ReleaseDate span.g-color-gray70::text').get() or \
-                           response.css('.c-gameDetails_ReleaseDate span:nth-of-type(2)::text').get() or \
-                           response.css('li.release_data span.data::text').get()
-        
-        # Genre - extract from c-genreList_item 
-        genre = response.css('.c-genreList_item .c-globalButton_label::text').get() or \
-               response.css('.c-genreList_item a span::text').get() or \
-               response.css('li.genre span.data::text').get()
-        
-        # Developer - extract from c-gameDetails_Developer
-        developer = response.css('.c-gameDetails_Developer a::text').get() or \
-                   response.css('.c-gameDetails_Developer li a::text').get() or \
-                   response.css('li.developer span.data::text').get()
-        
-        # Publisher - extract from c-gameDetails_Distributor (note: class is "Distributor" not "Publisher")
-        publisher = response.css('.c-gameDetails_Distributor a::text').get() or \
-                   response.css('.c-gameDetails_Distributor span:nth-of-type(2)::text').get() or \
-                   response.css('li.publisher span.data::text').get()
-        
-        # Clean up the extracted data
-        if game_title:
-            game_title = game_title.strip()
-        if platform:
-            platform = platform.strip()
-        if release_date_elem:
-            release_date = release_date_elem.strip()
-        else:
-            release_date = None
-        if genre:
-            genre = genre.strip()
-        if developer:
-            developer = developer.strip()
-        if publisher:
-            publisher = publisher.strip()
-        
-        self.logger.info(f"Game: {game_title} ({platform})")
-        self.logger.info(f"Release: {release_date}, Genre: {genre}")
-        self.logger.info(f"Developer: {developer}, Publisher: {publisher}")
-        
-        # Store game info for later use
+
+    def __init__(
+        self,
+        game_url=None,
+        game_name=None,
+        platform=None,
+        max_reviews_per_platform=None,
+        max_reviews=None,
+        flaresolverr_url=None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        limit = max_reviews_per_platform or max_reviews
+        self.max_reviews_per_platform = int(limit) if limit else None
+        self.flaresolverr_url = (flaresolverr_url or "").rstrip("/") or None
+        if self.flaresolverr_url:
+            host = urlparse(self.flaresolverr_url).hostname
+            if host and host not in self.allowed_domains:
+                self.allowed_domains = [*self.allowed_domains, host]
+        self.total_reviews_count = 0
+        self.platform_reviews_count = {}
+        self.seen_review_ids = set()
         self.game_info = {
-            'game_title': game_title,
-            'game_platform': platform,
-            'game_url': response.url,
-            'game_metascore': metascore,
-            'game_release_date': release_date,
-            'game_genre': genre,
-            'game_developer': developer,
-            'game_publisher': publisher,
+            "game_title": None,
+            "game_platform": platform,
+            "game_url": None,
+            "game_metascore": None,
+            "game_release_date": None,
+            "game_genre": None,
+            "game_developer": None,
+            "game_publisher": None,
         }
-        
-        # Navigate to user reviews page
-        # To get ALL reviews across all platforms, we need to remove the platform from URL
-        # Convert: /game/platform/game-name -> /game/game-name/user-reviews
-        # Note: Metacritic's review page may default to showing one platform at a time
-        # even on the cross-platform URL. The platform filter is handled via JavaScript
-        # on the client side. Individual reviews may not always include platform metadata.
-        import re
-        url_match = re.match(r'(https://www\.metacritic\.com/game)/([^/]+)/([^/]+)', response.url)
-        if url_match:
-            base_url = url_match.group(1)
-            platform_part = url_match.group(2)
-            game_name_part = url_match.group(3)
-            # Create cross-platform URL (without platform specification)
-            user_reviews_url = f"{base_url}/{game_name_part}/user-reviews"
-            self.logger.info(f"Cross-platform reviews URL: {user_reviews_url}")
-        else:
-            # Fallback to original behavior if URL doesn't match expected pattern
-            user_reviews_url = response.url.rstrip('/') + '/user-reviews'
-            self.logger.warning(f"Using platform-specific reviews URL: {user_reviews_url}")
-        
-        # Use Playwright to load and scroll through reviews
+
+        slug, url_platform = self._slug_from_url(game_url)
+        self.game_slug = game_name or slug
+        self.platform = platform or url_platform
+
+        if not self.game_slug:
+            raise ValueError("Either game_url or game_name is required")
+
+        self.review_url = self._build_review_url(self.game_slug, self.platform)
+        self.game_info["game_url"] = f"https://www.metacritic.com/game/{self.game_slug}/"
+
+    @staticmethod
+    def _slug_from_url(game_url):
+        if not game_url:
+            return None, None
+        path = urlparse(game_url).path.strip("/")
+        parts = [part for part in path.split("/") if part]
+        if not parts or parts[0] != "game":
+            return None, None
+        review_suffixes = {"user-reviews", "critic-reviews"}
+        if len(parts) >= 3 and parts[-1] in review_suffixes:
+            if len(parts) == 3:
+                return parts[1], None
+            return parts[2], parts[1]
+        if len(parts) >= 3:
+            return parts[2], parts[1]
+        if len(parts) == 2:
+            return parts[1], None
+        return None, None
+
+    @staticmethod
+    def _build_review_url(slug, platform=None):
+        url = f"https://www.metacritic.com/game/{slug}/user-reviews/"
+        if platform and platform not in ("all", "multiplatform", "unknown"):
+            url += f"?platform={platform}"
+        return url
+
+    async def start(self):
+        for request in self.start_requests():
+            yield request
+
+    def start_requests(self):
+        self.logger.info("Starting Metacritic reviews for %s", self.review_url)
+        if self.flaresolverr_url:
+            yield self._flaresolverr_request(
+                self.review_url,
+                self.parse_flaresolverr_page,
+                meta={"target_url": self.review_url},
+            )
+            return
+
         yield scrapy.Request(
-            url=user_reviews_url,
-            callback=self.parse_reviews_page,
+            url=self.review_url,
+            callback=self.parse_playwright_page,
             errback=self.handle_error,
             meta={
                 "playwright": True,
-                "playwright_include_page": True,
                 "playwright_page_goto_kwargs": {
-                    "wait_until": "domcontentloaded",  # Wait until DOM is ready
-                    "timeout": 60000,  # 60 seconds timeout
+                    "wait_until": "domcontentloaded",
+                    "timeout": 90000,
                 },
                 "playwright_page_methods": [
-                    {"wait_for_timeout": 5000},  # Additional 5 second wait
+                    {"wait_for_timeout": 5000},
                 ],
+            },
+        )
+
+    def _flaresolverr_request(self, target_url, callback, meta=None):
+        request_meta = dict(meta or {})
+        request_meta["target_url"] = target_url
+        return scrapy.Request(
+            url=f"{self.flaresolverr_url}/v1",
+            method="POST",
+            body=json.dumps(
+                {
+                    "cmd": "request.get",
+                    "url": target_url,
+                    "maxTimeout": 90000,
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+            callback=callback,
+            errback=self.handle_error,
+            meta=request_meta,
+            dont_filter=True,
+        )
+
+    def _solution_from_response(self, response):
+        try:
+            payload = json.loads(response.text)
+        except (TypeError, ValueError) as exc:
+            self.logger.error("Invalid FlareSolverr response: %s", exc)
+            return None, None
+
+        if payload.get("status") != "ok":
+            self.logger.error(
+                "FlareSolverr failed for %s: %s",
+                response.meta.get("target_url"),
+                payload.get("message"),
+            )
+            return None, None
+
+        solution = payload.get("solution") or {}
+        return solution.get("response") or "", solution.get("url")
+
+    def _decode_nuxt(self, html):
+        soup = BeautifulSoup(html, "html.parser")
+        script = soup.find("script", id="__NUXT_DATA__")
+        if not script or not script.string:
+            return None
+
+        try:
+            raw = json.loads(script.string)
+        except json.JSONDecodeError:
+            return None
+
+        nuxt = NuxtPayload(raw)
+        for index, value in enumerate(raw):
+            if not isinstance(value, dict) or "components" not in value:
+                continue
+            decoded = nuxt.resolve(index)
+            if isinstance(decoded, dict) and decoded.get("components"):
+                return decoded
+        return None
+
+    @staticmethod
+    def _find_component(nuxt, component_name):
+        for component in nuxt.get("components", []):
+            meta = component.get("meta") or {}
+            if meta.get("componentName") == component_name:
+                return component
+        return None
+
+    def _update_game_info(self, nuxt, page_url):
+        product = self._find_component(nuxt, "product")
+        if not product:
+            return
+
+        item = (product.get("data") or {}).get("item") or {}
+        if not isinstance(item, dict):
+            return
+
+        critic_score = item.get("criticScoreSummary") or {}
+        companies = ((item.get("production") or {}).get("companies") or [])
+        developer = next(
+            (company.get("name") for company in companies if company.get("typeName") == "Developer"),
+            None,
+        )
+        publisher = next(
+            (company.get("name") for company in companies if company.get("typeName") == "Publisher"),
+            None,
+        )
+        genres = [genre.get("name") for genre in (item.get("genres") or []) if genre.get("name")]
+
+        self.game_info.update(
+            {
+                "game_title": item.get("title"),
+                "game_platform": item.get("platform"),
+                "game_url": self._absolute_url(item.get("url")) or self.game_info.get("game_url"),
+                "game_metascore": critic_score.get("score"),
+                "game_release_date": item.get("releaseDateText") or item.get("releaseDate"),
+                "game_genre": ", ".join(genres) or None,
+                "game_developer": developer,
+                "game_publisher": publisher,
             }
         )
-    
-    async def parse_reviews_page(self, response):
-        """
-        Parse a page of user reviews with Playwright
-        
-        First discovers all available platforms, then scrapes reviews for each platform
-        """
-        
-        self.logger.info(f"Parsing reviews page: {response.url}")
-        
-        # Get the Playwright page object
-        page = response.meta.get("playwright_page")
-        
-        if page:
-            try:
-                # Wait for reviews to load
-                await page.wait_for_selector('div.c-siteReview, div.review_content', timeout=10000)
-                self.logger.info("✓ Initial reviews loaded")
-                
-                # Discover available platforms from dropdown
-                platforms = []
-                try:
-                    # First, click on the platform filter dropdown to make options visible
-                    # Look for the dropdown button (usually says "Filter by platform" or shows current platform)
-                    dropdown_button = await page.query_selector('button[data-testid="siteDropdown"]')
-                    if dropdown_button:
-                        self.logger.info("Clicking platform dropdown to reveal options...")
-                        await dropdown_button.click()
-                        await page.wait_for_timeout(1000)  # Wait for dropdown to open
-                    
-                    # Now get all dropdown options (should be visible after clicking)
-                    platform_options = await page.query_selector_all('div[data-testid="siteDropdownOptions"] div.c-siteDropdown_option span.u-text-overflow-ellipsis')
-                    
-                    # Known valid platforms - filter out review filter options
-                    valid_platforms = []
-                    filter_keywords = ['all reviews', 'positive', 'mixed', 'negative', 'recently added', 'score', 'reviews']
-                    
-                    for option in platform_options:
-                        platform_text = await option.text_content()
-                        if platform_text:
-                            platform_text = platform_text.strip()
-                            # Check if this is a platform (not a filter option)
-                            is_filter = any(keyword in platform_text.lower() for keyword in filter_keywords)
-                            if not is_filter and platform_text:
-                                valid_platforms.append(platform_text)
-                    
-                    platforms = valid_platforms
-                    
-                    if platforms:
-                        self.logger.info(f"✓ Found {len(platforms)} platform(s): {platforms}")
-                    else:
-                        self.logger.warning("No valid platforms found in dropdown, will scrape current page only")
-                        platforms = [None]  # Scrape whatever is currently displayed
-                        
-                except Exception as e:
-                    self.logger.warning(f"Could not find platform dropdown: {e}")
-                    platforms = [None]  # Scrape whatever is currently displayed
-                
-                # Close the initial page
-                await page.close()
-                
-                # Now scrape reviews for each platform
-                for platform in platforms:
-                    if platform:
-                        self.logger.info(f"🎮 Scraping reviews for platform: {platform}")
-                        # Construct platform-specific URL using query parameter
-                        # Convert platform text to URL format (e.g., "PlayStation 3" -> "playstation-3")
-                        platform_slug = platform.lower().replace(' ', '-')
-                        
-                        # Use query parameter for platform filtering
-                        platform_url = f"{response.url.rstrip('/')}?platform={platform_slug}"
-                        
-                        # Scrape this platform's reviews
-                        yield scrapy.Request(
-                            url=platform_url,
-                            callback=self.parse_platform_reviews,
-                            errback=self.handle_error,
-                            meta={
-                                "playwright": True,
-                                "playwright_include_page": True,
-                                "playwright_page_goto_kwargs": {
-                                    "wait_until": "domcontentloaded",
-                                    "timeout": 60000,
-                                },
-                                "playwright_page_methods": [
-                                    {"wait_for_timeout": 5000},
-                                ],
-                                "platform": platform,
-                            }
-                        )
-                    else:
-                        # No platform info, scrape current page
-                        yield scrapy.Request(
-                            url=response.url,
-                            callback=self.parse_platform_reviews,
-                            errback=self.handle_error,
-                            meta={
-                                "playwright": True,
-                                "playwright_include_page": True,
-                                "playwright_page_goto_kwargs": {
-                                    "wait_until": "domcontentloaded",
-                                    "timeout": 60000,
-                                },
-                                "playwright_page_methods": [
-                                    {"wait_for_timeout": 5000},
-                                ],
-                                "platform": None,
-                            }
-                        )
-                        
-            except Exception as e:
-                self.logger.error(f"Error during platform discovery: {e}")
-                if page:
-                    await page.close()
-        else:
-            # No Playwright page, fallback to regular parsing
-            for item in self.parse_platform_reviews(response):
-                yield item
-    
-    async def parse_platform_reviews(self, response):
-        """
-        Parse reviews for a specific platform
-        
-        Uses Playwright to scroll and load all reviews dynamically
-        """
-        
-        import asyncio
-        
-        platform = response.meta.get('platform', 'Unknown')
-        self.logger.info(f"Parsing reviews for {platform}: {response.url}")
-        
-        # Initialize counter for this platform if not exists
-        if platform not in self.platform_reviews_count:
-            self.platform_reviews_count[platform] = 0
-        
-        # Get the Playwright page object
-        page = response.meta.get("playwright_page")
-        
-        if page:
-            try:
-                # Wait for reviews to load with shorter timeout and better error handling
-                try:
-                    await page.wait_for_selector('div.c-siteReview, div.review_content', timeout=15000)
-                    self.logger.info(f"✓ Reviews loaded for {platform}")
-                except Exception as e:
-                    self.logger.warning(f"⚠ {platform}: Timeout waiting for reviews selector, will try to parse anyway: {e}")
-                    # Continue anyway - the page might have loaded but with different selectors
-                
-                # Scroll and load more reviews with overall timeout
-                previous_count = 0
-                scroll_attempts = 0
-                max_scroll_attempts = 200
-                no_change_count = 0  # Track consecutive attempts with no new reviews
-                max_time_per_platform = 300  # Reduced from 300s to 2 minutes max per platform
-                start_time = asyncio.get_event_loop().time()
-                
-                while scroll_attempts < max_scroll_attempts:
-                    # Check overall timeout
-                    elapsed_time = asyncio.get_event_loop().time() - start_time
-                    if elapsed_time > max_time_per_platform:
-                        self.logger.warning(f"⏱ {platform}: Timeout after {int(elapsed_time)}s, stopping scroll")
-                        break
-                    
-                    # Count current reviews with error handling
-                    try:
-                        current_reviews = await page.query_selector_all('div.c-siteReview, div.review_content')
-                        current_count = len(current_reviews)
-                    except Exception as e:
-                        self.logger.warning(f"⚠ {platform}: Error counting reviews: {e}")
-                        break
-                    
-                    self.logger.info(f"📊 {platform}: Currently loaded {current_count} reviews (attempt {scroll_attempts + 1}/{max_scroll_attempts})")
-                    
-                    # Check if we've reached max_reviews_per_platform limit for this platform
-                    if self.max_reviews_per_platform and current_count >= self.max_reviews_per_platform:
-                        self.logger.info(f"✓ {platform}: Reached platform limit of {self.max_reviews_per_platform} reviews")
-                        break
-                    
-                    # Check if no new reviews loaded
-                    if current_count == previous_count:
-                        no_change_count += 1
-                        if no_change_count >= 3:  # Exit after 3 consecutive attempts with no change
-                            self.logger.info(f"✓ {platform}: No more reviews to load (no change after {no_change_count} attempts)")
-                            break
-                    else:
-                        no_change_count = 0  # Reset counter when we see new reviews
-                    
-                    previous_count = current_count
-                    
-                    # Scroll to bottom to trigger loading more reviews
-                    try:
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(2000)  # Wait for new reviews to load
-                    except Exception as e:
-                        self.logger.warning(f"⚠ {platform}: Error during scroll: {e}")
-                        break
-                    
-                    # Look for and click "Load More" button if exists
-                    try:
-                        load_more_button = await page.query_selector('button:has-text("Load More"), a:has-text("Load More"), button.load-more')
-                        if load_more_button:
-                            self.logger.info(f"🔄 {platform}: Clicking 'Load More' button")
-                            await load_more_button.click()
-                            await page.wait_for_timeout(2000)
-                    except Exception as e:
-                        # No load more button or error clicking it
-                        pass
-                    
-                    scroll_attempts += 1
-                
-                self.logger.info(f"✓ {platform}: Finished loading reviews. Total: {previous_count}")
-                
-                # Get the final HTML content
-                try:
-                    content = await page.content()
-                except Exception as e:
-                    self.logger.error(f"❌ {platform}: Error getting page content: {e}")
-                    await page.close()
-                    return
-                
-                # Close the page
-                await page.close()
-                
-                # Parse the HTML with Scrapy selector
-                from scrapy.http import HtmlResponse
-                final_response = HtmlResponse(
-                    url=response.url,
-                    body=content.encode('utf-8'),
-                    encoding='utf-8'
-                )
-                
-            except Exception as e:
-                self.logger.error(f"❌ {platform}: Error during Playwright interaction: {e}")
-                if page:
-                    try:
-                        await page.close()
-                    except:
-                        pass
-                # Use the original response as fallback
-                final_response = response
-        else:
-            final_response = response
-        
-        # Find all review containers
-        reviews = final_response.css('div.review_content, div.c-siteReview')
-        
-        if not reviews:
-            self.logger.warning(f"No reviews found for {platform} on page: {response.url}")
-            reviews = final_response.css('div.user_review')
-        
-        self.logger.info(f"Found {len(reviews)} reviews to parse for {platform}")
-        
-        # Parse each review
-        for review in reviews:
-            # Check if we've reached the limit for this specific platform
-            if self.max_reviews_per_platform and self.platform_reviews_count.get(platform, 0) >= self.max_reviews_per_platform:
-                self.logger.info(f"✓ {platform}: Reached maximum reviews per platform limit: {self.max_reviews_per_platform}")
-                return
-            
-            item = self.parse_single_review(review, final_response, platform)
-            if item:
-                self.platform_reviews_count[platform] = self.platform_reviews_count.get(platform, 0) + 1
-                self.total_reviews_count += 1
-                yield item
-        
-        self.logger.info(f"✓ {platform}: Scraping complete. Collected {self.platform_reviews_count.get(platform, 0)} reviews for this platform (Total across all platforms: {self.total_reviews_count})")
-    
-    def parse_single_review(self, review_selector, response, platform=None):
-        """Extract data from a single review"""
-        
-        try:
-            # Extract review text - Modern Metacritic structure
-            review_text = review_selector.css('div.c-siteReview_quote span::text').get()
-            
-            if not review_text:
-                # Fallback: get all text from review quote
-                review_text_parts = review_selector.css('div.c-siteReview_quote::text').getall()
-                review_text = ' '.join([t.strip() for t in review_text_parts if t.strip()])
-            
-            if not review_text:
-                # Old structure fallback
-                review_text = review_selector.css('div.review_body span.blurb_expanded::text').get()
-            
-            if review_text:
-                review_text = ' '.join(review_text.split())  # Normalize whitespace
-            
-            # Extract score - Modern Metacritic uses div.c-siteReviewScore
-            score = review_selector.css('div.c-siteReviewScore span::text').get()
-            
-            if not score:
-                # Alternative selector
-                score = review_selector.css('div.c-siteReviewScore::text').get()
-            
-            if not score:
-                # Old structure fallback
-                score = review_selector.css('div.metascore_w::text').get()
-            
-            if score:
-                score = score.strip()
-                # Metacritic uses 0-10 scale, convert to 0-100
-                try:
-                    score = int(score) * 10
-                except ValueError:
-                    score = None
-            
-            # Determine category based on score
-            category = None
-            if score is not None:
-                if score >= 75:
-                    category = 'positive'
-                elif score >= 50:
-                    category = 'mixed'
-                else:
-                    category = 'negative'
-            
-            # Extract platform from individual review (for cross-platform pages)
-            # First, use the platform parameter passed from parse_platform_reviews
-            review_platform = platform
-            
-            if not review_platform:
-                # Try to extract from review HTML
-                review_platform = review_selector.css('div.c-siteReviewHeader_platform span::text').get()
-            
-            if not review_platform:
-                # Try alternative selectors
-                review_platform = review_selector.css('[class*="platform"] span::text').get() or \
-                                review_selector.css('[class*="Platform"]::text').get()
-            
-            if not review_platform:
-                # Fallback to game-level platform if not found in review
-                review_platform = self.game_info.get('game_platform')
-            
-            if review_platform:
-                review_platform = review_platform.strip()
-            
-            # Extract reviewer name - Modern selector
-            reviewer_name = review_selector.css('a.c-siteReviewHeader_username::text').get()
-            
-            if not reviewer_name:
-                # Try finding any element with 'username' in class
-                reviewer_name = review_selector.css('[class*="username"]::text').get()
-            
-            if not reviewer_name:
-                # Old structure fallbacks
-                reviewer_name = review_selector.css('div.name a::text').get() or \
-                              review_selector.css('span.name a::text').get()
-            
-            if reviewer_name:
-                reviewer_name = reviewer_name.strip()
-            
-            # Extract review date - Modern selector
-            review_date = review_selector.css('div.c-siteReview_reviewDate::text').get()
-            
-            if not review_date:
-                # Try finding any element with 'Date' or 'date' in class
-                review_date = review_selector.css('[class*="Date"]::text').get() or \
-                            review_selector.css('[class*="date"]::text').get()
-            
-            if not review_date:
-                # Old structure fallbacks
-                review_date = review_selector.css('div.date::text').get() or \
-                            review_selector.css('span.date::text').get() or \
-                            review_selector.css('time::attr(datetime)').get()
-            
-            if review_date:
-                review_date = review_date.strip()
-            
-            # Generate unique review ID
-            review_id = f"{self.game_info.get('game_title', 'unknown')}_{reviewer_name or 'anonymous'}_{review_date or 'no-date'}"
-            review_id = re.sub(r'[^\w\-]', '_', review_id)
-            
-            # Create item
-            item = GameReviewItem()
-            
-            # Game information
-            item['game_title'] = self.game_info.get('game_title')
-            item['game_platform'] = review_platform  # Use review-specific platform instead of game-level platform
-            item['game_url'] = self.game_info.get('game_url')
-            item['game_metascore'] = self.game_info.get('game_metascore')
-            item['game_release_date'] = self.game_info.get('game_release_date')
-            item['game_genre'] = self.game_info.get('game_genre')
-            item['game_developer'] = self.game_info.get('game_developer')
-            item['game_publisher'] = self.game_info.get('game_publisher')
-            
-            # Review information
-            item['review_id'] = review_id
-            item['review_text'] = review_text
-            item['review_score'] = score
-            item['review_category'] = category
-            item['reviewer_name'] = reviewer_name
-            item['review_date'] = review_date
-            item['review_url'] = response.url
-            
-            # Metadata
-            item['scraped_at'] = datetime.now().isoformat()
-            
-            return item
-            
-        except Exception as e:
-            self.logger.error(f"Error parsing review: {e}")
+
+        reviews = self._find_component(nuxt, "user-reviews")
+        if reviews:
+            review_items = ((reviews.get("data") or {}).get("items") or [])
+            if review_items:
+                product_info = review_items[0].get("reviewedProduct") or {}
+                if product_info.get("title"):
+                    self.game_info["game_title"] = product_info["title"]
+
+    @staticmethod
+    def _absolute_url(url):
+        if not url:
             return None
-    
+        if url.startswith("http"):
+            return url
+        return f"https://www.metacritic.com{url}"
+
+    def parse_flaresolverr_page(self, response):
+        html, final_url = self._solution_from_response(response)
+        if not html:
+            return
+
+        final_url = final_url or response.meta.get("target_url") or self.review_url
+        nuxt = self._decode_nuxt(html)
+        if nuxt:
+            self._update_game_info(nuxt, final_url)
+            reviews = self._find_component(nuxt, "user-reviews")
+            if reviews:
+                review_data = reviews.get("data") or {}
+                yield from self._yield_reviews(review_data.get("items") or [], final_url)
+                next_url = ((reviews.get("links") or {}).get("next") or {}).get("href")
+                if next_url and self._should_continue():
+                    yield self._flaresolverr_request(
+                        next_url,
+                        self.parse_flaresolverr_api,
+                        meta={"target_url": next_url},
+                    )
+                return
+
+        self.logger.warning("Nuxt payload not found; falling back to DOM parsing")
+        yield from self._parse_dom_reviews(html, final_url)
+
+    def parse_flaresolverr_api(self, response):
+        html, final_url = self._solution_from_response(response)
+        if not html:
+            return
+
+        try:
+            data = self._parse_json_body(html)
+        except ValueError as exc:
+            self.logger.error("Could not parse FlareSolverr API response: %s", exc)
+            return
+
+        review_data = data.get("data") or {}
+        yield from self._yield_reviews(review_data.get("items") or [], self.review_url)
+
+        next_url = ((data.get("links") or {}).get("next") or {}).get("href")
+        if next_url and self._should_continue():
+            yield self._flaresolverr_request(
+                next_url,
+                self.parse_flaresolverr_api,
+                meta={"target_url": next_url},
+            )
+
+    def parse_playwright_page(self, response):
+        html = response.text
+        nuxt = self._decode_nuxt(html)
+        if nuxt:
+            self._update_game_info(nuxt, response.url)
+            reviews = self._find_component(nuxt, "user-reviews")
+            if reviews:
+                review_data = reviews.get("data") or {}
+                yield from self._yield_reviews(review_data.get("items") or [], response.url)
+                next_url = ((reviews.get("links") or {}).get("next") or {}).get("href")
+                if next_url:
+                    self.logger.warning(
+                        "More reviews are available at %s. Use FlareSolverr to paginate.",
+                        next_url,
+                    )
+                return
+
+        self.logger.warning(
+            "Nuxt payload not found. Metacritic may be blocking Playwright with Cloudflare; "
+            "run with -a flaresolverr_url=http://localhost:8191"
+        )
+        yield from self._parse_dom_reviews(html, response.url)
+
+    @staticmethod
+    def _parse_json_body(body):
+        text = body.strip()
+        if text.startswith("{") or text.startswith("["):
+            return json.loads(text)
+
+        match = re.search(r"<pre[^>]*>(.*?)</pre>", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            text = html_lib.unescape(match.group(1))
+        else:
+            soup = BeautifulSoup(text, "html.parser")
+            pre = soup.find("pre")
+            text = pre.get_text() if pre else soup.get_text()
+
+        return json.loads(text)
+
+    def _should_continue(self):
+        if not self.max_reviews_per_platform:
+            return True
+        return self.total_reviews_count < self.max_reviews_per_platform
+
+    def _yield_reviews(self, reviews, page_url):
+        for review in reviews:
+            if not self._should_continue():
+                return
+            item = self._review_to_item(review, page_url)
+            if item:
+                yield item
+
+    def _review_to_item(self, review, page_url):
+        if not isinstance(review, dict):
+            return None
+
+        review_id = review.get("id")
+        if not review_id:
+            review_id = (
+                f"{self.game_info.get('game_title', 'unknown')}_"
+                f"{review.get('author') or 'anonymous'}_"
+                f"{review.get('date') or 'no-date'}"
+            )
+            review_id = re.sub(r"[^\w\-]", "_", review_id)
+
+        if review_id in self.seen_review_ids:
+            return None
+        self.seen_review_ids.add(review_id)
+
+        review_text = review.get("quote") or review.get("review") or ""
+        if isinstance(review_text, str):
+            review_text = html_lib.unescape(review_text)
+            review_text = " ".join(review_text.split())
+        if not review_text:
+            return None
+
+        score = review.get("score")
+        try:
+            score = int(float(score) * 10)
+        except (TypeError, ValueError):
+            score = None
+
+        category = None
+        if score is not None:
+            if score >= 75:
+                category = "positive"
+            elif score >= 50:
+                category = "mixed"
+            else:
+                category = "negative"
+
+        platform = review.get("platform") or self.game_info.get("game_platform")
+        reviewed_product = review.get("reviewedProduct") or {}
+
+        item = GameReviewItem()
+        item["game_title"] = self.game_info.get("game_title") or reviewed_product.get("title")
+        item["game_platform"] = platform
+        item["game_url"] = self.game_info.get("game_url")
+        item["game_metascore"] = self.game_info.get("game_metascore")
+        item["game_release_date"] = self.game_info.get("game_release_date")
+        item["game_genre"] = self.game_info.get("game_genre")
+        item["game_developer"] = self.game_info.get("game_developer")
+        item["game_publisher"] = self.game_info.get("game_publisher")
+
+        item["review_id"] = review_id
+        item["review_text"] = review_text
+        item["review_score"] = score
+        item["review_category"] = category
+        item["reviewer_name"] = review.get("author")
+        item["review_date"] = review.get("date")
+        item["review_url"] = page_url
+        item["scraped_at"] = datetime.now().isoformat()
+
+        self.total_reviews_count += 1
+        self.platform_reviews_count[platform] = (
+            self.platform_reviews_count.get(platform, 0) + 1
+        )
+        return item
+
+    def _parse_dom_reviews(self, html, page_url):
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select('[data-testid="review-card"]')
+        if not cards:
+            self.logger.warning("No review cards found on %s", page_url)
+            return
+
+        title = soup.select_one("h1")
+        if title and not self.game_info.get("game_title"):
+            self.game_info["game_title"] = title.get_text(" ", strip=True)
+
+        for card in cards:
+            if not self._should_continue():
+                return
+
+            quote = card.select_one('[data-testid="review-quote-text"]')
+            header = card.select_one('[data-testid="review-card-header"]')
+            date = card.select_one('[data-testid="review-card-date"]')
+            platform = card.select_one('[data-testid="review-platform"]')
+            score_el = card.select_one(".c-siteReviewScore")
+
+            score = None
+            if score_el:
+                score_match = re.search(r"\d+(?:\.\d+)?", score_el.get_text(" ", strip=True))
+                if score_match:
+                    score = int(float(score_match.group()) * 10)
+
+            author = None
+            if header:
+                author_text = header.get_text(" ", strip=True)
+                author_text = re.sub(r"^User score \d+ out of \d+\s*", "", author_text)
+                author = author_text.strip() or None
+
+            review = {
+                "id": None,
+                "quote": quote.get_text(" ", strip=True) if quote else None,
+                "score": score / 10 if score is not None else None,
+                "author": author,
+                "date": date.get_text(" ", strip=True) if date else None,
+                "platform": platform.get_text(" ", strip=True) if platform else None,
+            }
+            item = self._review_to_item(review, page_url)
+            if item:
+                yield item
+
     def handle_error(self, failure):
-        """Handle request failures"""
-        self.logger.error(f"Request failed: {failure.request.url}")
-        self.logger.error(f"Error: {failure.value}")
-        
-        # Try to provide helpful error messages
+        self.logger.error("Request failed: %s", failure.request.url)
+        self.logger.error("Error: %s", failure.value)
         if "TimeoutError" in str(failure.type) or "TCPTimedOutError" in str(failure.type):
-            self.logger.warning("Connection timeout - This could be due to:")
-            self.logger.warning("  1. Network connectivity issues")
-            self.logger.warning("  2. Metacritic blocking the requests")
-            self.logger.warning("  3. The game URL might not exist")
-            self.logger.warning("Try:")
-            self.logger.warning("  - Checking your internet connection")
-            self.logger.warning("  - Verifying the game name and platform are correct")
-            self.logger.warning("  - Increasing DOWNLOAD_DELAY in settings.py")
-            self.logger.warning("  - Trying a different game first")
+            self.logger.warning(
+                "Timeout. Check network, increase DOWNLOAD_DELAY, or use FlareSolverr."
+            )

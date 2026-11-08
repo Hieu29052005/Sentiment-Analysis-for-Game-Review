@@ -12,6 +12,10 @@ Usage:
 
 import requests
 from bs4 import BeautifulSoup
+import os
+import re
+import shutil
+import subprocess
 import time
 import json
 import csv
@@ -22,15 +26,87 @@ from pathlib import Path
 import random
 
 
+DEFAULT_FLARESOLVERR_URL = "http://localhost:8191"
+FLARESOLVERR_CONTAINER = "flaresolverr"
+
+
+def resolve_output_path(filename):
+    """Resolve output path without duplicating the data/ prefix."""
+    path = Path(filename)
+    if path.is_absolute():
+        return path
+    if path.parts and path.parts[0] == 'data':
+        return path
+    return Path('data') / path
+
+
+class FlareSolverrResponse:
+    """Minimal requests.Response-compatible wrapper for FlareSolverr."""
+
+    def __init__(self, status_code, content, url):
+        self.status_code = status_code
+        self.content = content.encode('utf-8') if isinstance(content, str) else content
+        self.text = self.content.decode('utf-8', errors='replace')
+        self.url = url
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error for url: {self.url}")
+
+
+class NuxtPayload:
+    """Decode Nuxt's devalue-serialized __NUXT_DATA__ array."""
+
+    SPECIAL = {
+        -1: None,
+        -2: None,
+        -3: float('nan'),
+        -4: float('inf'),
+        -5: float('-inf'),
+        -6: -0.0,
+    }
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.memo = {}
+
+    def resolve(self, ref):
+        if isinstance(ref, int):
+            if ref < 0:
+                return self.SPECIAL.get(ref)
+            if ref in self.memo:
+                return self.memo[ref]
+            value = self.payload[ref]
+            if isinstance(value, dict):
+                result = {}
+                self.memo[ref] = result
+                for key, child in value.items():
+                    result[key] = self.resolve(child)
+                return result
+            if isinstance(value, list):
+                result = []
+                self.memo[ref] = result
+                for child in value:
+                    result.append(self.resolve(child))
+                return result
+            self.memo[ref] = value
+            return value
+        return ref
+
+
 class GameDiscoverer:
     """Discovers games from Metacritic browse pages"""
     
-    def __init__(self, delay=1, max_pages=None, incremental=True, split_files=1):
+    def __init__(self, delay=1, max_pages=None, incremental=True, split_files=1, flaresolverr_url=None,
+                 auto_start_flaresolverr=True):
         self.base_url = "https://www.metacritic.com"
         self.delay = delay
         self.max_pages = max_pages
         self.incremental = incremental
         self.split_files = max(1, split_files)  # At least 1 file
+        self.flaresolverr_url = flaresolverr_url.rstrip('/') if flaresolverr_url else None
+        self.auto_start_flaresolverr = auto_start_flaresolverr
+        self._flaresolverr_start_attempted = False
         self.discovered_games = []
         self.session = requests.Session()
         self.session.headers.update({
@@ -55,11 +131,12 @@ class GameDiscoverer:
         # If splitting into multiple files
         if self.split_files > 1:
             self.output_files = []
-            base_name = filename.rsplit('.', 1)[0]
-            extension = filename.rsplit('.', 1)[1] if '.' in filename else output_format
+            base_path = resolve_output_path(filename)
+            base_name = base_path.stem
+            extension = base_path.suffix.lstrip('.') or output_format
             
             for i in range(self.split_files):
-                file_path = Path(f"data/{base_name}_part{i+1}.{extension}")
+                file_path = base_path.parent / f"{base_name}_part{i+1}.{extension}"
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 self.output_files.append(file_path)
                 
@@ -70,13 +147,13 @@ class GameDiscoverer:
                 elif output_format == 'csv':
                     with open(file_path, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
-                        writer.writerow(['title', 'game_name_slug', 'url', 'metascore', 'release_date', 'discovered_at'])
+                        writer.writerow(['title', 'game_name_slug', 'platform_slug', 'url', 'metascore', 'release_date', 'discovered_at'])
             
             self.output_file = self.output_files[0]  # Set first file as current
             return self.output_files
         else:
             # Single file mode
-            self.output_file = Path(f"data/{filename}")
+            self.output_file = resolve_output_path(filename)
             self.output_file.parent.mkdir(parents=True, exist_ok=True)
             
             # For JSON, start with an array
@@ -111,26 +188,21 @@ class GameDiscoverer:
                 items_in_file = self.discovered_count
             
             if output_format == 'txt':
-                # Simple format: just game name, one per line
+                # Format: game_slug|platform_slug
+                platform_slug = game_data.get('platform_slug') or 'multiplatform'
                 with open(current_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{game_data['game_name_slug']}\n")
+                    f.write(f"{game_data['game_name_slug']}|{platform_slug}\n")
             
             elif output_format == 'json':
-                with open(current_file, 'r+', encoding='utf-8') as f:
-                    # Move to end, overwrite the last closing bracket
-                    f.seek(0, 2)  # Go to end
-                    pos = f.tell()
-                    
-                    # Add comma if not first entry in this file
+                with open(current_file, 'a', encoding='utf-8') as f:
+                    # Add comma if this file already has entries
                     if items_in_file > 0:
-                        f.seek(pos - 2)  # Move back before \n
                         f.write(',\n')
                     
-                    # Write the game data
+                    # Write the game data (closing bracket is added in finalize)
                     json_line = json.dumps(game_data, indent=2, ensure_ascii=False)
-                    # Indent the JSON properly
                     json_line = '\n'.join('  ' + line for line in json_line.split('\n'))
-                    f.write(json_line + '\n')
+                    f.write(json_line)
             
             elif output_format == 'csv':
                 with open(current_file, 'a', newline='', encoding='utf-8') as f:
@@ -138,6 +210,7 @@ class GameDiscoverer:
                     writer.writerow([
                         game_data.get('title', ''),
                         game_data.get('game_name_slug', ''),
+                        game_data.get('platform_slug', ''),
                         game_data.get('url', ''),
                         game_data.get('metascore', ''),
                         game_data.get('release_date', ''),
@@ -167,6 +240,121 @@ class GameDiscoverer:
         except Exception as e:
             print(f"⚠ Error finalizing output file: {e}")
     
+    def _flaresolverr_is_healthy(self, url):
+        try:
+            response = requests.get(f"{url.rstrip('/')}/health", timeout=3)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def _start_flaresolverr_container(self):
+        if self._flaresolverr_start_attempted or not self.auto_start_flaresolverr:
+            return False
+        self._flaresolverr_start_attempted = True
+
+        if not shutil.which("docker"):
+            return False
+
+        try:
+            check = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"name=^{FLARESOLVERR_CONTAINER}$", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if FLARESOLVERR_CONTAINER not in check.stdout.split():
+                return False
+
+            print(f"  ⏳ FlareSolverr chưa chạy, đang start container '{FLARESOLVERR_CONTAINER}'...")
+            started = subprocess.run(
+                ["docker", "start", FLARESOLVERR_CONTAINER],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if started.returncode != 0:
+                print(f"  ⚠ Không start được FlareSolverr: {started.stderr.strip()}")
+                return False
+
+            for _ in range(20):
+                time.sleep(1)
+                if self._flaresolverr_is_healthy(DEFAULT_FLARESOLVERR_URL):
+                    print("  ✓ FlareSolverr đã sẵn sàng")
+                    return True
+        except Exception as exc:
+            print(f"  ⚠ Không thể tự start FlareSolverr: {exc}")
+
+        return False
+
+    def _resolve_flaresolverr_url(self):
+        candidates = []
+        for candidate in (
+            self.flaresolverr_url,
+            os.getenv('FLARESOLVERR_URL'),
+            DEFAULT_FLARESOLVERR_URL,
+        ):
+            if not candidate:
+                continue
+            normalized = candidate.rstrip('/')
+            if normalized not in candidates:
+                candidates.append(normalized)
+
+        for candidate in candidates:
+            if self._flaresolverr_is_healthy(candidate):
+                if candidate != self.flaresolverr_url:
+                    print(f"  ✓ Tự động dùng FlareSolverr: {candidate}")
+                self.flaresolverr_url = candidate
+                return candidate
+
+        if self._start_flaresolverr_container():
+            for candidate in candidates:
+                if self._flaresolverr_is_healthy(candidate):
+                    self.flaresolverr_url = candidate
+                    return candidate
+
+        return None
+
+    def _fetch_via_flaresolverr(self, url):
+        response = requests.post(
+            f"{self.flaresolverr_url}/v1",
+            json={
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": 90000,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != "ok":
+            raise RuntimeError(payload.get("message", "FlareSolverr request failed"))
+        solution = payload.get("solution") or {}
+        return FlareSolverrResponse(
+            int(solution.get("status", 200)),
+            solution.get("response", ""),
+            solution.get("url", url),
+        )
+
+    def _fetch(self, url):
+        """Fetch a URL, optionally through FlareSolverr to bypass Cloudflare."""
+        if not self.flaresolverr_url:
+            self._resolve_flaresolverr_url()
+
+        if self.flaresolverr_url:
+            try:
+                return self._fetch_via_flaresolverr(url)
+            except Exception as exc:
+                print(f"  ⚠ FlareSolverr failed: {exc}. Falling back to requests...")
+                self.flaresolverr_url = None
+
+        response = self.session.get(url, timeout=30)
+        if response.status_code in (403, 429):
+            if self._resolve_flaresolverr_url():
+                print("  ↻ Request trực tiếp bị chặn, thử lại qua FlareSolverr...")
+                return self._fetch_via_flaresolverr(url)
+
+        return response
+
     def discover_from_browse(self, platform=None, min_score=None, sort='score', output_format='txt', filename=None):
         """
         Discover games from Metacritic browse pages
@@ -217,61 +405,67 @@ class GameDiscoverer:
             print(f"\n[Page {page}] Fetching: {url}")
             
             try:
-                response = self.session.get(url, timeout=30)
+                response = self._fetch(url)
                 response.raise_for_status()
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Find game cards - Metacritic uses various selectors
-                # Try multiple selectors for different page layouts
-                game_cards = (
-                    soup.select('div.c-finderProductCard') or
-                    soup.select('td.clamp-summary-wrap') or
-                    soup.select('div.product_wrap') or
-                    []
-                )
+                # New Metacritic pages embed the game list in __NUXT_DATA__.
+                page_games_data, total_available = self._extract_games_from_nuxt(soup)
                 
-                if not game_cards:
-                    print(f"  ⚠ No game cards found on page {page}")
+                # Fallback for older layouts.
+                if not page_games_data:
+                    game_cards = (
+                        soup.select('div.c-finderProductCard') or
+                        soup.select('td.clamp-summary-wrap') or
+                        soup.select('div.product_wrap') or
+                        []
+                    )
+                    page_games_data = [
+                        self._extract_game_from_card(card, soup)
+                        for card in game_cards
+                    ]
+                    page_games_data = [game for game in page_games_data if game]
+                
+                if not page_games_data:
+                    print(f"  ⚠ No games found on page {page}")
                     break
                 
-                print(f"  Found {len(game_cards)} game cards")
+                print(f"  Found {len(page_games_data)} games")
+                if total_available is not None:
+                    print(f"  Total available: {total_available}")
                 
                 page_games = 0
-                for card in game_cards:
-                    game_data = self._extract_game_from_card(card, soup)
-                    
-                    if game_data:
-                        # Apply filters
-                        if min_score and game_data.get('metascore'):
-                            try:
-                                if int(game_data['metascore']) < min_score:
-                                    continue
-                            except (ValueError, TypeError):
-                                pass
-                        
-                        if platform and platform != 'all':
-                            if game_data.get('platform_slug') != platform:
+                for game_data in page_games_data:
+                    # Apply filters
+                    if min_score and game_data.get('metascore'):
+                        try:
+                            if int(game_data['metascore']) < min_score:
                                 continue
-                        
-                        self.discovered_games.append(game_data)
-                        page_games += 1
-                        games_found += 1
-                        
-                        # Save incrementally if enabled
-                        if self.incremental:
-                            self._append_game_to_file(game_data, output_format)
-                        
-                        print(f"  [{games_found}] {game_data['title']} - Score: {game_data.get('metascore', 'N/A')}")
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    if platform and platform != 'all':
+                        platform_slugs = game_data.get('platform_slugs') or []
+                        if platform not in platform_slugs:
+                            continue
+                    
+                    self.discovered_games.append(game_data)
+                    page_games += 1
+                    games_found += 1
+                    
+                    # Save incrementally if enabled
+                    if self.incremental:
+                        self._append_game_to_file(game_data, output_format)
+                    
+                    print(f"  [{games_found}] {game_data['title']} - Score: {game_data.get('metascore', 'N/A')}")
                 
                 if page_games == 0 and page > 1:
-                    # No games found and we're past page 1 - might be end or filter issue
                     print(f"  No games matched filters on page {page}")
-                    # Don't break immediately, might just be empty page
                 
-                # For Metacritic, if we got no game cards at all, we've reached the end
-                if len(game_cards) == 0:
-                    print(f"\n✓ No more pages (last page: {page - 1})")
+                # Stop when we've reached the total reported by the payload.
+                if total_available is not None and page * len(page_games_data) >= total_available:
+                    print(f"\n✓ No more pages (last page: {page})")
                     break
                 
                 page += 1
@@ -283,6 +477,15 @@ class GameDiscoverer:
                 
             except requests.RequestException as e:
                 print(f"  ✗ Error fetching page {page}: {e}")
+                if '403' in str(e):
+                    if self.flaresolverr_url:
+                        print("    FlareSolverr đang chạy nhưng vẫn bị Cloudflare chặn.")
+                        print("    Thử tăng --delay hoặc kiểm tra container FlareSolverr.")
+                    else:
+                        print("    Không vượt được Cloudflare và chưa có FlareSolverr healthy.")
+                        print("    Chạy:")
+                        print("    docker start flaresolverr")
+                        print("    python data_scrape_phase/discover_games.py ... --flaresolverr http://localhost:8191")
                 break
             except Exception as e:
                 print(f"  ✗ Error processing page {page}: {e}")
@@ -307,6 +510,83 @@ class GameDiscoverer:
         
         return self.discovered_games
     
+    @staticmethod
+    def _slugify_platform(name):
+        if not name:
+            return 'multiplatform'
+        slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+        aliases = {
+            'switch': 'nintendo-switch',
+            'switch-2': 'nintendo-switch-2',
+            'ps5': 'playstation-5',
+            'ps4': 'playstation-4',
+            'ps3': 'playstation-3',
+            'ps2': 'playstation-2',
+            'ps1': 'playstation',
+        }
+        return aliases.get(slug, slug)
+
+    def _extract_games_from_nuxt(self, soup):
+        """Extract the game list from Metacritic's Nuxt payload.
+
+        Returns (games, total_available). total_available is None if unknown.
+        """
+        script = soup.find('script', id='__NUXT_DATA__')
+        if not script or not script.string:
+            return [], None
+
+        try:
+            raw = json.loads(script.string)
+        except json.JSONDecodeError:
+            return [], None
+
+        nuxt = NuxtPayload(raw)
+        for index, value in enumerate(raw):
+            if not isinstance(value, dict) or 'items' not in value or 'total' not in value:
+                continue
+
+            decoded = nuxt.resolve(index)
+            items = decoded.get('items')
+            if not isinstance(items, list) or not items:
+                continue
+            if not isinstance(items[0], dict) or items[0].get('type') != 'game-title':
+                continue
+
+            games = [self._game_from_nuxt_item(item) for item in items]
+            games = [game for game in games if game]
+            return games, decoded.get('total')
+
+        return [], None
+
+    def _game_from_nuxt_item(self, item):
+        slug = item.get('slug')
+        if not slug:
+            return None
+
+        platforms = [
+            platform.get('name')
+            for platform in (item.get('platforms') or [])
+            if isinstance(platform, dict) and platform.get('name')
+        ]
+        platform_slugs = [self._slugify_platform(name) for name in platforms]
+        critic_score = item.get('criticScoreSummary') or {}
+        user_score = item.get('userScore') or {}
+
+        return {
+            'title': item.get('title'),
+            'game_name_slug': slug,
+            'url': f"{self.base_url}/game/{slug}/",
+            'metascore': critic_score.get('score'),
+            'user_score': user_score.get('score'),
+            'release_date': item.get('releaseDate'),
+            'rank': item.get('rank'),
+            'platform': platforms[0] if platforms else None,
+            'platform_slug': platform_slugs[0] if platform_slugs else 'multiplatform',
+            'platforms': platforms,
+            'platform_slugs': platform_slugs,
+            'discovered_at': datetime.now().isoformat(),
+        }
+
     def _extract_game_from_card(self, card, soup):
         """Extract game information from a card element"""
         try:
@@ -393,7 +673,7 @@ class GameDiscoverer:
         print(f"\nFetching: {search_url}")
         
         try:
-            response = self.session.get(search_url, timeout=30)
+            response = self._fetch(search_url)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -471,7 +751,7 @@ class GameDiscoverer:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"discovered_games_{timestamp}.{output_format}"
         
-        filepath = Path(f"data/{filename}")
+        filepath = resolve_output_path(filename)
         filepath.parent.mkdir(parents=True, exist_ok=True)
         
         try:
@@ -487,10 +767,11 @@ class GameDiscoverer:
                         writer.writerows(self.discovered_games)
             
             elif output_format == 'txt':
-                # Simple text format: one game per line
+                # Format: game_slug|platform_slug, one game per line
                 with open(filepath, 'w', encoding='utf-8') as f:
                     for game in self.discovered_games:
-                        f.write(f"{game['game_name_slug']}\n")
+                        platform_slug = game.get('platform_slug') or 'multiplatform'
+                        f.write(f"{game['game_name_slug']}|{platform_slug}\n")
             
             print(f"\n✓ Saved {len(self.discovered_games)} games to: {filepath}")
             
@@ -530,7 +811,7 @@ Examples:
                       help='Maximum number of pages to browse (default: 0, use 0 for unlimited)')
     parser.add_argument('--delay', type=float, default=1.0,
                       help='Delay between requests in seconds (default: 1.0)')
-    parser.add_argument('--format', type=str, default='json',
+    parser.add_argument('--format', type=str, default='txt',
                       choices=['json', 'csv', 'txt'],
                       help='Output format (default: txt)')
     parser.add_argument('--output', type=str, default=None,
@@ -539,11 +820,24 @@ Examples:
                       help='Search for specific game instead of browsing')
     parser.add_argument('--split-files', type=int, default=1,
                       help='Split output into N files (default: 1, no splitting)')
+    parser.add_argument('--flaresolverr', type=str, default=os.getenv('FLARESOLVERR_URL'),
+                      help='FlareSolverr URL to bypass Cloudflare (e.g. http://localhost:8191)')
+    parser.add_argument('--no-auto-start-flaresolverr', dest='auto_start_flaresolverr',
+                      action='store_false',
+                      help='Không tự start container flaresolverr nếu container đang dừng')
+    parser.set_defaults(auto_start_flaresolverr=True)
     
     args = parser.parse_args()
     
     # Create discoverer with incremental saving enabled by default
-    discoverer = GameDiscoverer(delay=args.delay, max_pages=args.max_pages, incremental=True, split_files=args.split_files)
+    discoverer = GameDiscoverer(
+        delay=args.delay,
+        max_pages=args.max_pages,
+        incremental=True,
+        split_files=args.split_files,
+        flaresolverr_url=args.flaresolverr,
+        auto_start_flaresolverr=args.auto_start_flaresolverr,
+    )
     
     # Discover games
     if args.search:
