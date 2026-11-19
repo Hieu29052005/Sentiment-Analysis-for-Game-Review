@@ -1,2 +1,5 @@
 .venv/
 __pycache__/
+data/
+data/hf_dataset/
+data/review_data/review_data_part32.jsonl
