@@ -261,10 +261,10 @@ def analyze_dataset(dataset_files):
 
 
 def main():
-    # Define paths
-    script_dir = Path(__file__).parent
-    input_dir = script_dir / 'data' / 'review_data'
-    output_file = script_dir / 'data' / 'aggregated_reviews_english.jsonl'
+    # Define paths (project root is the parent of this script's directory)
+    project_root = Path(__file__).resolve().parent.parent
+    input_dir = project_root / 'data' / 'review_data'
+    output_file = project_root / 'data' / 'aggregated_review_english' / 'aggregated_reviews_english.jsonl'
     
     # Create output directory if it doesn't exist
     output_file.parent.mkdir(parents=True, exist_ok=True)
